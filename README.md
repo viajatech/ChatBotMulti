@@ -6,7 +6,7 @@ Creado con la tecnología de Meta;
 ----
 https://huggingface.co/meta-llama/Llama-3.2-11B-Vision
 ----
-Requisitos Mínimos; 16 VRAM, 22 GB en RAM,CPU; 4 núcleos.
+Requisitos Mínimos; Tarjeta 16 GB VRAM,RAM 22GB,CPU 4 Núcleos.
 ----
 Requisitos de instalación;
 ----
