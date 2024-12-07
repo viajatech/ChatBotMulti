@@ -1,3 +1,13 @@
+#David Ruiz (@viajatech)
+#Licencia APACHE 2.0
+
+#Si utilizas mi script recuerda dar créditos (Apache 2.0) 
+#Se agradece tu estrellita en el repo de github
+#https://github.com/viajatech
+
+
+
+
 import os
 import random
 import asyncio
