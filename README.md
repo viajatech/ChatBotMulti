@@ -7,6 +7,7 @@ Creado con la tecnología de Meta;
 https://huggingface.co/meta-llama/Llama-3.2-11B-Vision
 ----
 Requisitos Mínimos; Tarjeta 16 GB VRAM,RAM 22GB,CPU 4 Núcleos.
+Los Safetensors (modelo/pesos) son de aprox 22 GB (asegurate de tener almanacenamiento disponible)
 ----
 Requisitos de instalación;
 ----
