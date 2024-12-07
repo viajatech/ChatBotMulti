@@ -2,7 +2,8 @@
 ---
 ![](https://github.com/viajatech/ChatBotMulti/blob/main/GUI%20CHATBOT%20MULTI%20SREENSHOT.png) 
 ----
-Creado con la tecnología de Meta;https://huggingface.co/meta-llama/Llama-3.2-11B-Vision
+Creado con la tecnología de Meta;
+https://huggingface.co/meta-llama/Llama-3.2-11B-Vision
 ----
 Requisitos Mínimos; 16 VRAM, 22 GB en RAM,CPU; 4 núcleos.
 ----
