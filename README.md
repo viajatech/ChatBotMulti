@@ -30,6 +30,8 @@ Favor de dar créditos y mencionar este repositorio si lo utilizas para fines co
 ----
 Solicitar acceso a Meta ;
 https://huggingface.co/meta-llama/Llama-3.2-11B-Vision
+
+
 (Verificar en tu e-mail si fuiste aprobado;
 https://huggingface.co/settings/gated-repos)
 
