@@ -1,0 +1,224 @@
+import os
+import random
+import asyncio
+from langdetect import detect
+import gradio as gr
+import torch
+from PIL import Image
+from transformers import MllamaForConditionalGeneration, AutoProcessor, set_seed
+
+HF_TOKEN = os.getenv("HF_TOKEN", "tu_token_aquí")
+
+model_id = "meta-llama/Llama-3.2-11B-Vision"
+
+print("Cargando el modelo y el procesador...")
+model = MllamaForConditionalGeneration.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    token=HF_TOKEN
+)
+
+processor = AutoProcessor.from_pretrained(model_id, token=HF_TOKEN)
+print("Modelo cargado exitosamente.")
+
+def set_random_seed_wrapper(seed):
+    if seed is not None and seed.strip().isdigit():
+        seed = int(seed)
+        set_seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+def detect_language(text):
+    try:
+        lang = detect(text)
+    except:
+        lang = 'es'
+    if lang not in ['en', 'es']:
+        lang = 'es'
+    return lang
+
+def build_prompt(user_name, chatbot_name, story_context, conversation_history, user_input, language, image_provided):
+    instructions = f"""
+Tu objetivo es responder coherentemente y en el mismo idioma que el usuario.
+Si el usuario habla en español, responde en español; si en inglés, responde en inglés.
+No mezcles idiomas sin razón. No respondas como si fueras el usuario ni hables en su nombre.
+No te hagas pasar por el usuario. No uses el nombre del usuario como si fueras tú.
+Manténte fiel al contexto inicial y no te desvíes del tema ni de las preguntas.
+Si se proporciona una imagen, descríbela o respóndela acorde a su contenido de forma coherente.
+El usuario se llama {user_name}, tú te llamas {chatbot_name}.
+Contexto inicial de la historia:
+{story_context}
+
+Historial de la conversación:
+"""
+    for msg in conversation_history:
+        if msg['role'] == 'user':
+            instructions += f"\n{msg['content']}"
+        else:
+            instructions += f"\n{msg['content']}"
+
+    # Añadimos el mensaje actual del usuario
+    if image_provided:
+        prompt = f"{instructions}\n{user_name}: <|image|><|begin_of_text|>{user_input}\n{chatbot_name}:"
+    else:
+        prompt = f"{instructions}\n{user_name}: <|begin_of_text|>{user_input}\n{chatbot_name}:"
+
+    return prompt.strip()
+
+async def generate_response(user_input, user_name, chatbot_name, story_context, seed_input, max_new_tokens, temperature, top_p, repetition_penalty, state, image_input):
+    if state is None:
+        state = {
+            'conversation_history': [],
+            'user_name': user_name or "Usuario",
+            'chatbot_name': chatbot_name or "Asistente",
+            'story_context': story_context or "",
+            'seed': seed_input,
+            'language': 'es',
+            'reward_score': 0.0,
+            'punishment_score': 0.0
+        }
+    else:
+        if user_name:
+            state['user_name'] = user_name
+        if chatbot_name:
+            state['chatbot_name'] = chatbot_name
+        if story_context is not None:
+            state['story_context'] = story_context
+        if seed_input:
+            state['seed'] = seed_input
+
+    language = detect_language(user_input)
+    state['language'] = language
+
+    set_random_seed_wrapper(state['seed'])
+
+    adjusted_temperature = float(temperature) - (0.05 * state['reward_score'])
+    if adjusted_temperature < 0.1:
+        adjusted_temperature = 0.1
+    adjusted_repetition_penalty = float(repetition_penalty) + (0.1 * state['punishment_score'])
+    if adjusted_repetition_penalty > 2.0:
+        adjusted_repetition_penalty = 2.0
+
+    image_provided = image_input is not None
+    # Construimos una representación del historial en formato de mensajes
+    # Cada mensaje en conversation_history es un dict con {"role":"user"/"assistant", "content":"Nombre: texto"}
+    # Vamos a tomar lo que ya tenemos o, si no, crearlo desde el estado
+    # El state['conversation_history'] ya lo guardaremos en ese formato.
+
+    prompt = build_prompt(
+        user_name=state['user_name'],
+        chatbot_name=state['chatbot_name'],
+        story_context=state['story_context'],
+        conversation_history=state['conversation_history'],
+        user_input=user_input,
+        language=state['language'],
+        image_provided=image_provided
+    )
+
+    device = model.device
+    if image_provided:
+        # Según ejemplo oficial del modelo
+        inputs = processor(image=image_input, text=prompt, return_tensors="pt").to(device)
+    else:
+        inputs = processor(text=prompt, return_tensors="pt").to(device)
+
+    max_new_tokens = int(max_new_tokens)
+    if max_new_tokens < 1:
+        max_new_tokens = 20  # Un mínimo decente si el usuario pone algo raro
+
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=adjusted_temperature,
+            top_p=float(top_p),
+            repetition_penalty=adjusted_repetition_penalty,
+            do_sample=True,
+            pad_token_id=processor.tokenizer.eos_token_id
+        )
+
+    result = processor.decode(output[0])
+    if state['chatbot_name'] + ":" in result:
+        response_candidate = result.split(f"{state['chatbot_name']}:")[-1].strip()
+    else:
+        response_candidate = result.strip()
+
+    # Añadimos el mensaje del usuario al historial
+    state['conversation_history'].append({"role":"user", "content":f"{state['user_name']}: {user_input}"})
+    # Añadimos la respuesta del chatbot al historial
+    state['conversation_history'].append({"role":"assistant", "content":f"{state['chatbot_name']}: {response_candidate}"})
+
+    # Retornamos el historial en formato que Gradio Chatbot con type='messages' pueda usar:
+    # Necesitamos una lista de dicts con keys 'role' y 'content'
+    return state['conversation_history'], state
+
+def reset_conversation():
+    return [], None
+
+def like_response(state):
+    if state is not None:
+        state['reward_score'] = state.get('reward_score', 0.0) + 1.0
+    return state
+
+def dislike_response(state):
+    if state is not None:
+        state['punishment_score'] = state.get('punishment_score', 0.0) + 1.0
+    return state
+
+def main():
+    with gr.Blocks() as demo:
+        gr.Markdown("## Chatbot Multi by ViajaTech")
+
+        # Chatbot con type='messages'
+        chatbot_display = gr.Chatbot(
+            label="Historial de la Conversación",
+            height=500,
+            show_label=True,
+            type='messages'  # usar formato role/content
+        )
+
+        state = gr.State()
+
+        # Botones debajo del historial
+        with gr.Row():
+            submit_btn = gr.Button("Enviar")
+            reset_btn = gr.Button("Reiniciar Conversación")
+            like_btn = gr.Button("👍")
+            dislike_btn = gr.Button("👎")
+
+        # Tu mensaje debajo de los botones
+        user_input = gr.Textbox(label="Tu mensaje", placeholder="Escribe aquí tu mensaje", lines=2)
+
+        # Parametros debajo de "Tu mensaje"
+        user_name = gr.Textbox(label="Tu nombre (Usuario)", placeholder="Ej: David")
+        chatbot_name = gr.Textbox(label="Nombre del Chatbot", placeholder="Ej: Isabella")
+        story_context = gr.Textbox(label="Contexto o Historia Inicial", placeholder="Contexto inicial de la charla", lines=3)
+        seed_input = gr.Textbox(label="Semilla (opcional)", placeholder="Número entero para reproducir resultados")
+        max_new_tokens = gr.Slider(label="Máx Tokens de Respuesta", minimum=1, maximum=300, step=10, value=150)
+        temperature = gr.Slider(label="Temperature", minimum=0.1, maximum=1.0, step=0.05, value=0.5)
+        top_p = gr.Slider(label="Top-p", minimum=0.1, maximum=1.0, step=0.05, value=0.9)
+        repetition_penalty = gr.Slider(label="Penalización por Repetición", minimum=1.0, maximum=2.0, step=0.05, value=1.2)
+
+        # Sección de subir imagen al final
+        image_input = gr.Image(label="Subir Imagen (opcional)", type="pil")
+
+        def handle_submit(*args):
+            return asyncio.run(generate_response(*args))
+
+        submit_btn.click(
+            handle_submit,
+            inputs=[user_input, user_name, chatbot_name, story_context, seed_input, max_new_tokens, temperature, top_p, repetition_penalty, state, image_input],
+            outputs=[chatbot_display, state]
+        )
+
+        reset_btn.click(fn=reset_conversation, inputs=[], outputs=[chatbot_display, state])
+        like_btn.click(fn=like_response, inputs=[state], outputs=[state])
+        dislike_btn.click(fn=dislike_response, inputs=[state], outputs=[state])
+
+    demo.launch(share=False)
+
+if __name__ == "__main__":
+    main()
