@@ -1,0 +1,305 @@
+#David Ruiz (@viajatech)
+#Licencia APACHE 2.0
+
+#Si utilizas mi script recuerda dar créditos (Apache 2.0) 
+#Se agradece tu estrellita en el repo de github
+#https://github.com/viajatech
+
+
+import os
+import random
+import asyncio
+from langdetect import detect
+import gradio as gr
+import torch
+from PIL import Image
+from transformers import MllamaForConditionalGeneration, AutoProcessor, set_seed
+from datetime import datetime
+from dateutil import tz
+import requests
+from geopy.geocoders import Nominatim
+
+# Cambia esto por la ruta local de tu modelo si lo tienes descargado
+LOCAL_MODEL_PATH = "modelo_local"
+
+HF_TOKEN = os.getenv("HF_TOKEN", "tu_token_aquí")
+model_id = "meta-llama/Llama-3.2-11B-Vision"
+
+print("Verificando existencia de modelo local...")
+
+if os.path.isdir(LOCAL_MODEL_PATH):
+    print("Cargando el modelo y el procesador desde el directorio local...")
+    model = MllamaForConditionalGeneration.from_pretrained(
+        LOCAL_MODEL_PATH,
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    processor = AutoProcessor.from_pretrained(LOCAL_MODEL_PATH)
+else:
+    print("No se encontró el modelo local. Cargando desde HuggingFace...")
+    model = MllamaForConditionalGeneration.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        token=HF_TOKEN
+    )
+    processor = AutoProcessor.from_pretrained(model_id, token=HF_TOKEN)
+
+print("Modelo cargado exitosamente.")
+
+geolocator = Nominatim(user_agent="my_geocoder")
+
+def set_random_seed_wrapper(seed):
+    if seed is not None and seed.strip().isdigit():
+        seed = int(seed)
+        set_seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+def detect_language(text):
+    try:
+        lang = detect(text)
+    except:
+        lang = 'es'
+    if lang not in ['en', 'es']:
+        lang = 'es'
+    return lang
+
+def build_prompt(user_name, chatbot_name, story_context, conversation_history, user_input, language, internet_enabled):
+    instructions = f"""
+INSTRUCCIONES DEL SISTEMA (NO IGNORAR):
+
+- Eres el asistente "{chatbot_name}" (assistant).
+- El usuario se llama "{user_name}" (user).
+- No escribas como si fueras el usuario.
+- Responde en el mismo idioma del usuario.
+- No desvíes el tema, responde a las peticiones del usuario.
+- Mantente fiel al contexto inicial y al historial.
+- Usa todos los tokens solicitados (min_new_tokens = max_new_tokens).
+- No mezclar roles, no inventar líneas del usuario.
+- Si internet_enabled es True, puedes obtener hora/fecha, lugares cercanos (Overpass API) y buscar imágenes en la web.
+- Si el usuario pide una imagen/foto (en cualquier idioma), busca una imagen relacionada en Unsplash (sin API key) usando `https://source.unsplash.com/`.
+- Descarga la imagen, muéstrala en el chat con Markdown: `![descripcion](file=imagen.jpg)`
+- No terminar abruptamente.
+
+Contexto inicial:
+{story_context}
+
+Historial de la conversación:
+"""
+    for msg in conversation_history:
+        instructions += f"\n{msg['content']}"
+
+    prompt = f"{instructions}\n{user_name}: <|begin_of_text|>{user_input}\n{chatbot_name}:"
+    return prompt.strip()
+
+def get_current_time():
+    now = datetime.now(tz=tz.gettz('UTC')).astimezone(tz=None)
+    return now.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def search_places_osm(address, query="cafe"):
+    location = geolocator.geocode(address)
+    if not location:
+        return "No se encontró la dirección."
+    lat, lon = location.latitude, location.longitude
+
+    overpass_url = "http://overpass-api.de/api/interpreter"
+    radius = 1000
+    overpass_query = f"""
+    [out:json];
+    node
+      ["amenity"="{query}"]
+      (around:{radius},{lat},{lon});
+    out;
+    """
+    response = requests.get(overpass_url, params={'data': overpass_query})
+    if response.status_code != 200:
+        return "No se pudo acceder a la API de Overpass."
+    data = response.json()
+    if 'elements' not in data or not data['elements']:
+        return f"No se encontraron lugares cercanos para '{query}'."
+    results = []
+    for elem in data['elements'][:3]:
+        name = elem['tags'].get('name', 'Desconocido')
+        results.append(f"{name} - Coordenadas: {elem['lat']}, {elem['lon']}")
+    return "\n".join(results)
+
+def extract_image_keyword(user_input):
+    user_words = user_input.lower().split()
+    keywords = ["imagen", "foto", "picture", "photo", "image", "pic"]
+    for i, w in enumerate(user_words):
+        if w in keywords and i+1 < len(user_words):
+            query_terms = user_words[i+1:]
+            return "+".join(query_terms)
+    return "+".join(user_words)
+
+def download_image(query):
+    url = f"https://source.unsplash.com/1600x900/?{query}"
+    r = requests.get(url)
+    if r.status_code == 200:
+        img_path = "imagen_descargada.jpg"
+        with open(img_path, 'wb') as f:
+            f.write(r.content)
+        return img_path
+    return None
+
+async def generate_response(user_input, user_name, chatbot_name, story_context, seed_input, max_new_tokens, temperature, top_p, repetition_penalty, state, internet_toggle):
+    if state is None:
+        state = {
+            'conversation_history': [],
+            'user_name': user_name or "Usuario",
+            'chatbot_name': chatbot_name or "Asistente",
+            'story_context': story_context or "",
+            'seed': seed_input,
+            'language': 'es',
+            'reward_score': 0.0,
+            'punishment_score': 0.0
+        }
+    else:
+        if user_name:
+            state['user_name'] = user_name
+        if chatbot_name:
+            state['chatbot_name'] = chatbot_name
+        if story_context is not None:
+            state['story_context'] = story_context
+        if seed_input:
+            state['seed'] = seed_input
+
+    language = detect_language(user_input)
+    state['language'] = language
+
+    set_random_seed_wrapper(state['seed'])
+
+    adjusted_temperature = float(temperature)
+    if adjusted_temperature < 0.1:
+        adjusted_temperature = 0.1
+    adjusted_repetition_penalty = float(repetition_penalty)
+
+    max_new_tokens = int(max_new_tokens)
+    if max_new_tokens < 1:
+        max_new_tokens = 20
+    min_new_tokens = max_new_tokens
+
+    internet_enabled = (internet_toggle == True)
+
+    additional_info = ""
+    user_input_lower = user_input.lower()
+    if internet_enabled:
+        if "hora" in user_input_lower or "fecha" in user_input_lower:
+            current_time = get_current_time()
+            additional_info += f"La hora actual es: {current_time}\n"
+        if "cercana" in user_input_lower or "cercano" in user_input_lower:
+            address = "milan #4 de izcalli piramide"
+            results = search_places_osm(address, query="cafe")
+            additional_info += f"Lugares cercanos:\n{results}\n"
+        keywords_imagen = ["imagen", "foto", "picture", "photo", "image", "pic"]
+        if any(k in user_input_lower for k in keywords_imagen):
+            query = extract_image_keyword(user_input)
+            img_path = download_image(query)
+            if img_path:
+                additional_info += f"Aquí tienes la imagen solicitada:\n![imagen](file={img_path})\n"
+            else:
+                additional_info += "No pude encontrar una imagen adecuada.\n"
+
+    prompt = build_prompt(
+        user_name=state['user_name'],
+        chatbot_name=state['chatbot_name'],
+        story_context=state['story_context'],
+        conversation_history=state['conversation_history'],
+        user_input=user_input + "\n" + additional_info,
+        language=state['language'],
+        internet_enabled=internet_enabled
+    )
+
+    device = model.device
+    inputs = processor(text=prompt, return_tensors="pt").to(device)
+
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+            min_new_tokens=min_new_tokens,
+            max_new_tokens=max_new_tokens,
+            temperature=adjusted_temperature,
+            top_p=float(top_p),
+            repetition_penalty=adjusted_repetition_penalty,
+            do_sample=True,
+            pad_token_id=processor.tokenizer.eos_token_id,
+            no_repeat_ngram_size=3
+        )
+
+    result = processor.decode(output[0])
+    if state['chatbot_name'] + ":" in result:
+        response_candidate = result.split(f"{state['chatbot_name']}:")[-1].strip()
+    else:
+        response_candidate = result.strip()
+
+    state['conversation_history'].append({"role":"user", "content":f"{state['user_name']}: {user_input}"})
+    state['conversation_history'].append({"role":"assistant", "content":f"{state['chatbot_name']}: {response_candidate}"})
+
+    return state['conversation_history'], state
+
+def reset_conversation():
+    return [], None
+
+def like_response(state):
+    if state is not None:
+        state['reward_score'] = state.get('reward_score', 0.0) + 1.0
+    return state
+
+def dislike_response(state):
+    if state is not None:
+        state['punishment_score'] = state.get('punishment_score', 0.0) + 1.0
+    return state
+
+def main():
+    with gr.Blocks() as demo:
+        gr.Markdown("## Chatbot Multi by ViajaTech")
+
+        chatbot_display = gr.Chatbot(
+            label="Historial de la Conversación",
+            height=500,
+            show_label=True,
+            type='messages'
+        )
+
+        state = gr.State()
+
+        with gr.Row():
+            submit_btn = gr.Button("Enviar")
+            reset_btn = gr.Button("Reiniciar Conversación")
+            like_btn = gr.Button("👍")
+            dislike_btn = gr.Button("👎")
+            internet_toggle = gr.Checkbox(label="Buscar en Internet", value=False)
+
+        user_input = gr.Textbox(label="Tu mensaje", placeholder="Escribe aquí tu mensaje", lines=2)
+
+        user_name = gr.Textbox(label="Tu nombre (Usuario)", placeholder="Ej: David")
+        chatbot_name = gr.Textbox(label="Nombre del Chatbot", placeholder="Ej: Isabella")
+        story_context = gr.Textbox(label="Contexto o Historia Inicial", placeholder="Contexto inicial de la charla", lines=3)
+        seed_input = gr.Textbox(label="Semilla (opcional)", placeholder="Número entero para reproducir resultados")
+        
+        # Ahora permitimos hasta 3000 tokens
+        max_new_tokens = gr.Slider(label="Máx Tokens de Respuesta", minimum=1, maximum=3000, step=10, value=150)
+        temperature = gr.Slider(label="Temperature", minimum=0.1, maximum=1.0, step=0.05, value=0.3)
+        top_p = gr.Slider(label="Top-p", minimum=0.1, maximum=1.0, step=0.05, value=0.9)
+        repetition_penalty = gr.Slider(label="Penalización por Repetición", minimum=1.0, maximum=2.0, step=0.05, value=1.2)
+
+        def handle_submit(*args):
+            return asyncio.run(generate_response(*args))
+
+        submit_btn.click(
+            handle_submit,
+            inputs=[user_input, user_name, chatbot_name, story_context, seed_input, max_new_tokens, temperature, top_p, repetition_penalty, state, internet_toggle],
+            outputs=[chatbot_display, state]
+        )
+
+        reset_btn.click(fn=reset_conversation, inputs=[], outputs=[chatbot_display, state])
+        like_btn.click(fn=like_response, inputs=[state], outputs=[state])
+        dislike_btn.click(fn=dislike_response, inputs=[state], outputs=[state])
+
+    demo.launch(share=False)
+
+if __name__ == "__main__":
+    main()
